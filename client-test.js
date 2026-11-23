@@ -1,7 +1,7 @@
 const { io } = require("socket.io-client");
 
 // Ganti string kosong ini dengan Token JWT asli dari Postman
-const TOKEN = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpZCI6Niwicm9sZSI6Im1hbmFnZXIiLCJpYXQiOjE3OTEyOTU3NTUsImV4cCI6MTc5MTMyNDU1NX0.WHF_dW0rYtECu--_TvU1qsZO1m0Cu52_CJ-NHkfrvLs"; 
+const TOKEN = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpZCI6Niwicm9sZSI6Im1hbmFnZXIiLCJpYXQiOjE3OTE4MDg2ODEsImV4cCI6MTc5MTgzNzQ4MX0.H3UoNlVQl7_Xc5uo-lu99WrfjfRkIlW2Pfpcy9X4v7Y"; 
 
 const socket = io("http://localhost:3000", {
     auth: { token: TOKEN }

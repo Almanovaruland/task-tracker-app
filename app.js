@@ -1,37 +1,27 @@
-// const express = require('express');
-// const cors = require('cors');
-// require('dotenv').config();
-
-// const authRoutes = require('./src/routes/authRoutes');
-// const apiRoutes = require('./src/routes/apiRoutes'); // Tambahkan baris ini
-
-// const app = express();
-
-// app.use(cors());
-// app.use(express.json());
-
-// // Daftarkan routes
-// app.use('/api/auth', authRoutes); // Untuk register & login
-// app.use('/api', apiRoutes);       // Untuk seluruh CRUD Project & Task
-
-// const PORT = process.env.PORT || 3000;
-// app.listen(PORT, () => {
-//     console.log(`Server berjalan di http://localhost:${PORT}`);
-// });
-
 const express = require('express');
-const http = require('http'); // 1. Import modul HTTP bawaan Node
+const http = require('http');
 const cors = require('cors');
 require('dotenv').config();
 
+// === GLOBAL ERROR HANDLER PROSES NODE.JS ===
+process.on('uncaughtException', (err) => {
+    console.error('[CRITICAL - UNCAUGHT EXCEPTION]:', err.name, err.message);
+    console.error(err.stack);
+});
+
+process.on('unhandledRejection', (reason, promise) => {
+    console.error('[CRITICAL - UNHANDLED REJECTION] at:', promise, 'reason:', reason);
+});
+
 const authRoutes = require('./src/routes/authRoutes');
 const apiRoutes = require('./src/routes/apiRoutes');
-const socketConfig = require('./src/config/socket'); // 2. Import config socket
+const socketConfig = require('./src/config/socket');
+const { errorHandler } = require('./src/middleware/errorHandler');
 
 const app = express();
-const server = http.createServer(app); // 3. Bungkus app Express dengan server HTTP
+const server = http.createServer(app);
 
-// 4. Inisialisasi Socket.IO
+// Inisialisasi Socket.IO
 socketConfig.init(server);
 
 app.use(cors());
@@ -40,9 +30,19 @@ app.use(express.json());
 app.use('/api/auth', authRoutes);
 app.use('/api', apiRoutes);
 
+// Handler Rute Tidak Ditemukan (404)
+app.use((req, res) => {
+    res.status(404).json({
+        code: 'ENDPOINT_NOT_FOUND',
+        message: `Endpoint ${req.method} ${req.originalUrl} tidak ditemukan.`
+    });
+});
+
+// Express Global Error Handler (Wajib paling bawah)
+app.use(errorHandler);
+
 const PORT = process.env.PORT || 3000;
 
-// 5. UBAH app.listen MENJADI server.listen
 server.listen(PORT, () => {
     console.log(`Server Express & Socket.IO berjalan di http://localhost:${PORT}`);
 });

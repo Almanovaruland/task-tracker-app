@@ -1,246 +1,413 @@
-const socket = require('../config/socket');
 const db = require('../config/db');
+const socketConfig = require('../config/socket');
+const { sanitizeFreetext } = require('../utils/sanitizer');
 
-// HELPER: Fungsi untuk mengambil data task secara utuh (termasuk JOIN dengan user)
-const getCompleteTaskData = async (taskId) => {
-    const [tasks] = await db.execute(`
-        SELECT t.*, 
-        GROUP_CONCAT(u.id) as assignee_ids,
-        GROUP_CONCAT(u.name SEPARATOR ', ') as assignee_names 
-        FROM tasks t 
-        LEFT JOIN task_assignees ta ON t.id = ta.task_id 
-        LEFT JOIN users u ON ta.user_id = u.id 
-        WHERE t.id = ? GROUP BY t.id
-    `, [taskId]);
-    return tasks[0];
-};
-
-// GET /api/tasks (Dengan JOIN, Search, Filter, Pagination)
-exports.getAllTasks = async (req, res) => {
+// GET /api/tasks - Mengambil daftar task sesuai role dan filter
+exports.getAllTasks = async (req, res, next) => {
     try {
-        const { project_id, status, priority, assignee_id, q, page = 1, limit = 10 } = req.query;
-        const offset = (Number(page) - 1) * Number(limit);
-        
+        const { q, status, priority, project_id, assignee_id, page = 1, limit = 100 } = req.query;
+        const offset = (page - 1) * parseInt(limit);
+
         let query = `
-            SELECT t.*, 
-            GROUP_CONCAT(u.id) as assignee_ids,
-            GROUP_CONCAT(u.name SEPARATOR ', ') as assignee_names
-            FROM tasks t 
-            LEFT JOIN task_assignees ta ON t.id = ta.task_id 
+            SELECT 
+                t.*, 
+                p.name AS project_name,
+                GROUP_CONCAT(u.name SEPARATOR ', ') AS assignee_names,
+                GROUP_CONCAT(u.id) AS assignee_ids
+            FROM tasks t
+            LEFT JOIN projects p ON t.project_id = p.id
+            LEFT JOIN task_assignees ta ON t.id = ta.task_id
             LEFT JOIN users u ON ta.user_id = u.id
+            WHERE 1=1
         `;
-        
-        const params = [];
-        const conditions = [];
 
-        if (project_id) { conditions.push('t.project_id = ?'); params.push(project_id); }
-        if (status) { conditions.push('t.status = ?'); params.push(status); }
-        if (priority) { conditions.push('t.priority = ?'); params.push(priority); }
-        if (assignee_id) { conditions.push('ta.user_id = ?'); params.push(assignee_id); }
-        if (q) { conditions.push('t.title LIKE ?'); params.push(`%${q}%`); }
+        const queryParams = [];
 
-        if (conditions.length > 0) {
-            query += ' WHERE ' + conditions.join(' AND ');
+        if (req.user && req.user.role === 'staff') {
+            query += ` AND t.id IN (SELECT task_id FROM task_assignees WHERE user_id = ?)`;
+            queryParams.push(req.user.id);
+        } else if (assignee_id) {
+            query += ` AND t.id IN (SELECT task_id FROM task_assignees WHERE user_id = ?)`;
+            queryParams.push(assignee_id);
         }
 
-        query += ' GROUP BY t.id LIMIT ? OFFSET ?';
-        params.push(Number(limit), Number(offset));
+        if (q) {
+            query += ` AND t.title LIKE ?`;
+            queryParams.push(`%${sanitizeFreetext(q, 100)}%`);
+        }
+        if (status) {
+            query += ` AND t.status = ?`;
+            queryParams.push(status);
+        }
+        if (priority) {
+            query += ` AND t.priority = ?`;
+            queryParams.push(priority);
+        }
+        if (project_id) {
+            query += ` AND t.project_id = ?`;
+            queryParams.push(project_id);
+        }
 
-        const [tasks] = await db.query(query, params);
-        res.json({ page: Number(page), data: tasks });
+        query += ` GROUP BY t.id ORDER BY t.id ASC LIMIT ? OFFSET ?`;
+        queryParams.push(parseInt(limit), parseInt(offset));
+
+        const [tasks] = await db.query(query, queryParams);
+
+        res.status(200).json({ status: 'success', data: tasks });
     } catch (error) {
-        console.error(error);
-        res.status(500).json({ message: 'Terjadi kesalahan server' });
+        next(error);
     }
 };
 
-// GET /api/tasks/:id
-exports.getTaskById = async (req, res) => {
+// GET /api/tasks/:id - Mengambil detail task berdasarkan ID
+exports.getTaskById = async (req, res, next) => {
     try {
-        const task = await getCompleteTaskData(req.params.id);
+        const { id } = req.params;
 
-        if (!task) return res.status(404).json({ message: 'Task tidak ditemukan' });
-        res.json({ data: task });
+        const [tasks] = await db.query(`
+            SELECT 
+                t.*, 
+                p.name AS project_name,
+                GROUP_CONCAT(u.id) AS assignee_ids,
+                GROUP_CONCAT(u.name SEPARATOR ', ') AS assignee_names
+            FROM tasks t
+            LEFT JOIN projects p ON t.project_id = p.id
+            LEFT JOIN task_assignees ta ON t.id = ta.task_id
+            LEFT JOIN users u ON ta.user_id = u.id
+            WHERE t.id = ?
+            GROUP BY t.id
+        `, [id]);
+
+        if (tasks.length === 0) {
+            return res.status(404).json({ code: 'TASK_NOT_FOUND', message: "Tugas tidak ditemukan." });
+        }
+
+        const task = tasks[0];
+        task.assignee_ids = task.assignee_ids ? task.assignee_ids.split(',').map(Number) : [];
+
+        res.status(200).json({ status: 'success', data: task });
     } catch (error) {
-        console.error(error);
-        res.status(500).json({ message: 'Terjadi kesalahan server' });
+        next(error);
     }
 };
 
-// POST /api/tasks (Manager Only - Transaksi Insert ke 2 Tabel)
-exports.createTask = async (req, res) => {
-    const conn = await db.getConnection(); 
+// POST /api/tasks - Membuat task baru (Manager only dengan Validasi & Sanitasi)
+exports.createTask = async (req, res, next) => {
     try {
-        await conn.beginTransaction(); 
-        const { project_id, title, description, due_date, priority, status, assignees } = req.body;
-        
-        const [taskResult] = await conn.execute(
-            'INSERT INTO tasks (project_id, title, description, due_date, priority, status, created_by) VALUES (?, ?, ?, ?, ?, ?, ?)',
-            [project_id, title, description, due_date, priority, status || 'todo', req.user.id]
-        );
-        const newTaskId = taskResult.insertId;
+        let { project_id, title, description, due_date, priority, assignees } = req.body;
+        const created_by = req.user.id;
 
-        const io = socket.getIo();
+        // 1. Sanitasi Input Freetext
+        title = sanitizeFreetext(title, 150);
+        description = sanitizeFreetext(description, 2000);
+        const cleanPriority = priority ? sanitizeFreetext(priority, 20) : 'medium';
 
-        if (assignees && Array.isArray(assignees) && assignees.length > 0) {
-            for (let user_id of assignees) {
-                await conn.execute('INSERT INTO task_assignees (task_id, user_id) VALUES (?, ?)', [newTaskId, user_id]);
-            }
+        // 2. Validasi Field Wajib
+        if (!project_id || !title || !due_date) {
+            return res.status(400).json({ 
+                code: 'VALIDATION_ERROR', 
+                message: "Judul, ID Proyek, dan Tanggal Deadline (due_date) wajib diisi." 
+            });
         }
 
-        await conn.commit(); 
-        
-        // Ambil data utuh yang sudah di-commit untuk dikirim via Socket dan Response
-        const finalTask = await getCompleteTaskData(newTaskId);
+        // 3. Validasi ENUM Priority
+        const validPriorities = ['low', 'medium', 'high'];
+        if (!validPriorities.includes(cleanPriority)) {
+            return res.status(400).json({ 
+                code: 'INVALID_ENUM', 
+                message: "Prioritas harus bernilai: low, medium, atau high." 
+            });
+        }
 
-        // EMIT ke staff yang bersangkutan setelah data utuh didapat
-        if (assignees && Array.isArray(assignees) && assignees.length > 0) {
-            for (let user_id of assignees) {
-                io.to(`user:${user_id}`).emit('task:assigned', { 
-                    message: 'Anda ditugaskan ke task baru',
-                    data: finalTask
+        // 4. Validasi Due Date (Tidak boleh di masa lalu)
+        const today = new Date().toISOString().split('T')[0];
+        if (due_date < today) {
+            return res.status(400).json({ 
+                code: 'INVALID_DUE_DATE', 
+                message: "Tanggal deadline (due_date) tidak boleh diisi tanggal yang sudah lewat." 
+            });
+        }
+
+        // 5. Validasi Keberadaan Project
+        const [projects] = await db.query('SELECT id FROM projects WHERE id = ?', [project_id]);
+        if (projects.length === 0) {
+            return res.status(404).json({ 
+                code: 'PROJECT_NOT_FOUND', 
+                message: "Proyek yang dituju tidak ditemukan." 
+            });
+        }
+
+        // 6. Validasi Duplikat Assignee di Array Payload
+        if (assignees && Array.isArray(assignees)) {
+            const uniqueCheck = new Set(assignees.map(Number));
+            if (uniqueCheck.size !== assignees.length) {
+                return res.status(400).json({ 
+                    code: 'DUPLICATE_ASSIGNEE', 
+                    message: 'Terdapat duplikat penugasan staff untuk task yang sama.' 
                 });
             }
         }
-        
-        // EMIT ke semua manager
-        io.to('managers').emit('task:created', { 
-            message: 'Task baru berhasil dibuat',
-            data: finalTask 
-        });
-        
-        res.status(201).json({ 
-            message: 'Task berhasil dibuat', 
-            data: finalTask 
-        });
-    } catch (error) {
-        await conn.rollback(); 
-        console.error(error);
-        res.status(500).json({ message: 'Error server, transaksi dibatalkan' });
-    } finally {
-        conn.release(); 
-    }
-};
 
-// PUT /api/tasks/:id (Manager Only - Edit Detail)
-exports.updateTaskDetail = async (req, res) => {
-    try {
-        const { title, description, due_date, priority } = req.body;
-        await db.execute(
-            'UPDATE tasks SET title=?, description=?, due_date=?, priority=? WHERE id=?',
-            [title, description, due_date, priority, req.params.id]
+        // 7. Insert Task
+        const [result] = await db.query(
+            'INSERT INTO tasks (project_id, title, description, due_date, priority, created_by, created_at) VALUES (?, ?, ?, ?, ?, ?, NOW())',
+            [project_id, title, description, due_date, cleanPriority, created_by]
         );
 
-        // Ambil data terbaru setelah diperbarui
-        const updatedTask = await getCompleteTaskData(req.params.id);
+        const taskId = result.insertId;
 
-        socket.getIo().emit('task:updated', { 
-            message: 'Detail task telah diperbarui',
-            data: updatedTask
-        });
-
-        res.json({ 
-            message: 'Detail task berhasil diperbarui', 
-            data: updatedTask 
-        });
-    } catch (error) {
-        console.error(error);
-        res.status(500).json({ message: 'Terjadi kesalahan server' });
-    }
-};
-
-// PUT /api/tasks/:id/status (Ownership Check: Hanya assignee atau manager yang boleh edit)
-exports.updateTaskStatus = async (req, res) => {
-    try {
-        const taskId = req.params.id;
-        const userId = req.user.id;
-        const { status } = req.body;
-
-        if (req.user.role !== 'manager') {
-            const [pivotCheck] = await db.execute('SELECT * FROM task_assignees WHERE task_id = ? AND user_id = ?', [taskId, userId]);
-            if (pivotCheck.length === 0) return res.status(403).json({ message: 'Akses ditolak.' });
+        // 8. Insert Assignees
+        if (assignees && Array.isArray(assignees) && assignees.length > 0) {
+            const pivotValues = assignees.map(userId => [taskId, userId]);
+            await db.query('INSERT INTO task_assignees (task_id, user_id) VALUES ?', [pivotValues]);
         }
 
-        await db.execute('UPDATE tasks SET status = ? WHERE id = ?', [status, taskId]);
-        
-        // Ambil data terbaru setelah status berubah
-        const updatedTask = await getCompleteTaskData(taskId);
-
-        socket.getIo().emit('task:updated', { 
-            message: `Status diubah menjadi ${status}`,
-            data: updatedTask
-        });
-
-        res.json({ 
-            message: 'Status task berhasil diubah',
-            data: updatedTask
-        });
-    } catch (error) {
-        console.error(error);
-        res.status(500).json({ message: 'Terjadi kesalahan server' });
-    }
-};
-
-// DELETE /api/tasks/:id (Manager Only)
-exports.deleteTask = async (req, res) => {
-    try {
-        // Ambil data task sebelum dihapus untuk dikembalikan sebagai log
-        const taskToDelete = await getCompleteTaskData(req.params.id);
-        
-        if (!taskToDelete) {
-            return res.status(404).json({ message: 'Task tidak ditemukan' });
+        // Emit Socket.IO
+        try {
+            const io = socketConfig.getIo();
+            io.emit('task:created', { id: taskId, title });
+            if (assignees && assignees.length > 0) {
+                io.emit('task:assigned', { task_id: taskId, assignees });
+            }
+        } catch (socketErr) {
+            console.error("Socket emit error:", socketErr);
         }
 
-        await db.execute('DELETE FROM tasks WHERE id = ?', [req.params.id]);
-        
-        res.json({ 
-            message: 'Task berhasil dihapus',
-            data: taskToDelete
+        res.status(201).json({
+            status: 'success',
+            message: "Tugas berhasil dibuat",
+            data: { id: taskId, title }
         });
     } catch (error) {
-        console.error(error);
-        res.status(500).json({ message: 'Terjadi kesalahan server' });
+        next(error);
     }
 };
 
-// POST /api/tasks/:id/assignees (Manager Only - Insert ke tabel pivot)
-exports.addAssignee = async (req, res) => {
+// PUT /api/tasks/:id - Edit detail task (Manager only)
+exports.updateTask = async (req, res, next) => {
     try {
+        const { id } = req.params;
+        let { title, description, due_date, priority, status } = req.body;
+
+        const [tasks] = await db.query('SELECT * FROM tasks WHERE id = ?', [id]);
+        if (tasks.length === 0) {
+            return res.status(404).json({ code: 'TASK_NOT_FOUND', message: "Tugas tidak ditemukan." });
+        }
+
+        const currentTask = tasks[0];
+        const cleanTitle = title ? sanitizeFreetext(title, 150) : currentTask.title;
+        const cleanDesc = description !== undefined ? sanitizeFreetext(description, 2000) : currentTask.description;
+        const cleanPriority = priority ? sanitizeFreetext(priority, 20) : currentTask.priority;
+        const cleanStatus = status ? sanitizeFreetext(status, 20) : currentTask.status;
+        const newDueDate = due_date || currentTask.due_date;
+
+        if (!['low', 'medium', 'high'].includes(cleanPriority)) {
+            return res.status(400).json({ code: 'INVALID_ENUM', message: "Priority harus low, medium, atau high." });
+        }
+        if (!['todo', 'in_progress', 'done'].includes(cleanStatus)) {
+            return res.status(400).json({ code: 'INVALID_ENUM', message: "Status harus todo, in_progress, atau done." });
+        }
+
+        const today = new Date().toISOString().split('T')[0];
+        if (due_date && due_date < today) {
+            return res.status(400).json({ code: 'INVALID_DUE_DATE', message: "Due date tidak boleh di masa lalu." });
+        }
+
+        await db.query(
+            'UPDATE tasks SET title = ?, description = ?, due_date = ?, priority = ?, status = ?, updated_at = NOW() WHERE id = ?',
+            [cleanTitle, cleanDesc, newDueDate, cleanPriority, cleanStatus, id]
+        );
+
+        res.status(200).json({ status: 'success', message: "Detail tugas berhasil diperbarui." });
+    } catch (error) {
+        next(error);
+    }
+};
+
+// POST /api/tasks/:id/assignees - Tambah assignee satuan (Manager only)
+exports.addAssignee = async (req, res, next) => {
+    try {
+        const { id } = req.params;
         const { user_id } = req.body;
-        await db.execute('INSERT IGNORE INTO task_assignees (task_id, user_id) VALUES (?, ?)', [req.params.id, user_id]);
-        
-        // Ambil data task terbaru yang sudah memuat nama assignee baru
-        const updatedTask = await getCompleteTaskData(req.params.id);
 
-        socket.getIo().to(`user:${user_id}`).emit('task:assigned', { 
-            message: 'Anda ditambahkan ke task yang sudah ada',
-            data: updatedTask
-        });
+        if (!user_id) {
+            return res.status(400).json({ code: 'VALIDATION_ERROR', message: "user_id wajib disertakan." });
+        }
 
-        res.json({ 
-            message: 'Assignee berhasil ditambahkan',
-            data: updatedTask
-        });
+        const [tasks] = await db.query('SELECT id FROM tasks WHERE id = ?', [id]);
+        if (tasks.length === 0) {
+            return res.status(404).json({ code: 'TASK_NOT_FOUND', message: "Tugas tidak ditemukan." });
+        }
+
+        try {
+            await db.query('INSERT INTO task_assignees (task_id, user_id) VALUES (?, ?)', [id, user_id]);
+        } catch (err) {
+            if (err.code === 'ER_DUP_ENTRY') {
+                return res.status(400).json({
+                    code: 'DUPLICATE_ASSIGNEE',
+                    message: "Staff tersebut sudah ditugaskan pada task ini (Duplikat ditolak)."
+                });
+            }
+            throw err;
+        }
+
+        try {
+            const io = socketConfig.getIo();
+            io.emit('task:assigned', { task_id: id, assignees: [user_id] });
+        } catch (socketErr) {
+            console.error("Socket emit error:", socketErr);
+        }
+
+        res.status(201).json({ status: 'success', message: "Staff berhasil ditugaskan ke task." });
     } catch (error) {
-        console.error(error);
-        res.status(500).json({ message: 'Terjadi kesalahan server' });
+        next(error);
     }
 };
 
-// DELETE /api/tasks/:id/assignees/:user_id (Manager Only - Hapus dari tabel pivot)
-exports.removeAssignee = async (req, res) => {
+// PUT /api/tasks/:id/status - Update status task
+exports.updateTaskStatus = async (req, res, next) => {
     try {
-        await db.execute('DELETE FROM task_assignees WHERE task_id = ? AND user_id = ?', [req.params.id, req.params.user_id]);
-        
-        // Ambil data task terbaru yang sudah tidak memuat nama assignee tersebut
-        const updatedTask = await getCompleteTaskData(req.params.id);
+        const { id } = req.params;
+        const { status } = req.body;
+        const userId = req.user.id;
+        const userRole = req.user.role;
 
-        res.json({ 
-            message: 'Assignee berhasil dihapus dari task',
-            data: updatedTask
+        const cleanStatus = sanitizeFreetext(status, 20);
+        const validStatuses = ['todo', 'in_progress', 'done'];
+        if (!validStatuses.includes(cleanStatus)) {
+            return res.status(400).json({ code: 'INVALID_ENUM', message: "Status tidak valid. Pilihan: todo, in_progress, done." });
+        }
+
+        const [tasks] = await db.query('SELECT * FROM tasks WHERE id = ?', [id]);
+        if (tasks.length === 0) {
+            return res.status(404).json({ code: 'TASK_NOT_FOUND', message: "Tugas tidak ditemukan." });
+        }
+
+        if (userRole === 'staff') {
+            const [assignments] = await db.query('SELECT * FROM task_assignees WHERE task_id = ? AND user_id = ?', [id, userId]);
+            if (assignments.length === 0) {
+                return res.status(403).json({ code: 'FORBIDDEN_ACTION', message: "Akses ditolak. Anda bukan assignee tugas ini." });
+            }
+        }
+
+        await db.query('UPDATE tasks SET status = ?, updated_at = NOW() WHERE id = ?', [cleanStatus, id]);
+
+        const [updatedTasks] = await db.query(`
+            SELECT 
+                t.*, p.name AS project_name,
+                GROUP_CONCAT(u.id) AS assignee_ids, GROUP_CONCAT(u.name SEPARATOR ', ') AS assignee_names
+            FROM tasks t
+            LEFT JOIN projects p ON t.project_id = p.id
+            LEFT JOIN task_assignees ta ON t.id = ta.task_id
+            LEFT JOIN users u ON ta.user_id = u.id
+            WHERE t.id = ? GROUP BY t.id
+        `, [id]);
+
+        const updatedTask = updatedTasks[0];
+        updatedTask.assignee_ids = updatedTask.assignee_ids ? updatedTask.assignee_ids.split(',').map(Number) : [];
+
+        try {
+            const io = socketConfig.getIo();
+            io.emit('task:updated', updatedTask); 
+        } catch (socketErr) {
+            console.error("Socket emit error:", socketErr);
+        }
+
+        res.status(200).json({ status: 'success', message: "Status tugas berhasil diperbarui", data: updatedTask });
+    } catch (error) {
+        next(error);
+    }
+};
+
+// DELETE /api/tasks/:id - Hapus task (Manager only)
+exports.deleteTask = async (req, res, next) => {
+    try {
+        const { id } = req.params;
+        const [tasks] = await db.query('SELECT id FROM tasks WHERE id = ?', [id]);
+        if (tasks.length === 0) {
+            return res.status(404).json({ code: 'TASK_NOT_FOUND', message: "Tugas tidak ditemukan." });
+        }
+
+        await db.query('DELETE FROM tasks WHERE id = ?', [id]);
+        res.status(200).json({ status: 'success', message: "Tugas berhasil dihapus" });
+    } catch (error) {
+        next(error);
+    }
+};
+
+// GET /api/stats - Mengambil statistik tugas menyesuaikan Role
+exports.getTaskStats = async (req, res, next) => {
+    try {
+        const userId = req.user.id;
+        const role = req.user.role;
+
+        let projectQuery = '';
+        let statsQuery = '';
+        let overdueQuery = '';
+        let queryParams = [];
+
+        if (role === 'manager') {
+            projectQuery = 'SELECT COUNT(id) AS total_projects FROM projects';
+            statsQuery = `
+                SELECT 
+                    COUNT(id) AS total_tasks,
+                    IFNULL(SUM(CASE WHEN status = 'done' THEN 1 ELSE 0 END), 0) AS completed_tasks,
+                    IFNULL(SUM(CASE WHEN status = 'todo' THEN 1 ELSE 0 END), 0) AS todo_tasks,
+                    IFNULL(SUM(CASE WHEN status = 'in_progress' THEN 1 ELSE 0 END), 0) AS in_progress_tasks
+                FROM tasks
+            `;
+            overdueQuery = `
+                SELECT COUNT(id) AS overdue_tasks
+                FROM tasks
+                WHERE due_date < CURDATE() AND status != 'done'
+            `;
+        } else {
+            projectQuery = `
+                SELECT COUNT(DISTINCT t.project_id) AS total_projects 
+                FROM tasks t 
+                JOIN task_assignees ta ON t.id = ta.task_id 
+                WHERE ta.user_id = ?
+            `;
+            statsQuery = `
+                SELECT 
+                    COUNT(t.id) AS total_tasks,
+                    IFNULL(SUM(CASE WHEN t.status = 'done' THEN 1 ELSE 0 END), 0) AS completed_tasks,
+                    IFNULL(SUM(CASE WHEN t.status = 'todo' THEN 1 ELSE 0 END), 0) AS todo_tasks,
+                    IFNULL(SUM(CASE WHEN t.status = 'in_progress' THEN 1 ELSE 0 END), 0) AS in_progress_tasks
+                FROM tasks t
+                JOIN task_assignees ta ON t.id = ta.task_id
+                WHERE ta.user_id = ?
+            `;
+            overdueQuery = `
+                SELECT COUNT(t.id) AS overdue_tasks
+                FROM tasks t
+                JOIN task_assignees ta ON t.id = ta.task_id
+                WHERE t.due_date < CURDATE() AND t.status != 'done' AND ta.user_id = ?
+            `;
+            queryParams = [userId];
+        }
+
+        const [projectResult] = await db.query(projectQuery, queryParams);
+        const totalProjects = projectResult[0].total_projects || 0;
+
+        const [taskStatsResult] = await db.query(statsQuery, queryParams);
+        const taskStats = taskStatsResult[0];
+
+        const [overdueResult] = await db.query(overdueQuery, queryParams);
+        const overdueTasks = overdueResult[0].overdue_tasks || 0;
+
+        res.status(200).json({
+            status: 'success',
+            data: {
+                total_projects: totalProjects,
+                total_tasks: taskStats.total_tasks || 0,
+                completed_tasks: taskStats.completed_tasks || 0,
+                todo_tasks: taskStats.todo_tasks || 0,
+                in_progress_tasks: taskStats.in_progress_tasks || 0,
+                overdue_tasks: overdueTasks
+            }
         });
     } catch (error) {
-        console.error(error);
-        res.status(500).json({ message: 'Terjadi kesalahan server' });
+        next(error);
     }
 };

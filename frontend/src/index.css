@@ -1,0 +1,29 @@
+@import "tailwindcss";
+
+body {
+  font-family: 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
+  background-color: #362765; /* Warna tema latar ungu gelap pekat */
+  color: #333;
+}
+
+/* Custom Scrollbar agar rapi */
+::-webkit-scrollbar { width: 6px; height: 6px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: #cbd5e1; border-radius: 10px; }
+
+.react-calendar__tile--active {
+  background: #362765 !important;
+  color: white !important;
+  border-radius: 8px;
+}
+.react-calendar__tile--now {
+  background: #f0f4fd !important;
+  color: #362765 !important;
+  border-radius: 8px;
+  font-weight: bold;
+}
+.react-calendar__tile:enabled:hover,
+.react-calendar__navigation button:enabled:hover {
+  background-color: #f0f4fd !important;
+  border-radius: 8px;
+}
